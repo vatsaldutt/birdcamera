@@ -37,7 +37,7 @@ PUSH_URL = "https://api.vatsaldutt.com/feed/push"
 
 # Shared secret — must match FEEDER_PUSH_SECRET in server.py.
 # Leave as empty string "" if server.py also has it as "".
-PUSH_SECRET = "mysecret123"
+PUSH_SECRET = ""
 
 # Target frames per second. 6–8 is a good balance on Pi Zero + home WiFi.
 FPS = 8
@@ -263,17 +263,24 @@ def _capture_loop_picamera2():
     try:
         config = cam.create_video_configuration(
             main={"size": (CAPTURE_WIDTH, CAPTURE_HEIGHT), "format": "RGB888"},
+            # KEY FIX: force the 640x480 native sensor mode as the raw ISP input.
+            # Without this, libcamera picks 1920x1080 raw, which clocks out too slowly
+            # for the Pi Zero's 1-second V4L2 dequeue timer → camera times out on frame 1.
+            # 640x480 runs at ~58fps natively, which easily beats the timer.
+            # The ISP upscales to CAPTURE_WIDTH x CAPTURE_HEIGHT for the output stream.
+            raw={"size": (RAW_WIDTH, RAW_HEIGHT)},
             controls={
-                # Allow the sensor to pick a frame duration in this range.
-                # Locking to a single value (old code) causes the V4L2 dequeue timeout on OV5647.
                 "FrameDurationLimits": (FRAME_DURATION_MIN_US, FRAME_DURATION_MAX_US),
             },
         )
         cam.configure(config)
-        log.info(f"[OK]  Camera configured: {CAPTURE_WIDTH}x{CAPTURE_HEIGHT}, "
+        log.info(f"[OK]  Camera configured: output {CAPTURE_WIDTH}x{CAPTURE_HEIGHT} "
+                 f"← raw {RAW_WIDTH}x{RAW_HEIGHT} sensor mode | "
                  f"frame window {FRAME_DURATION_MIN_US//1000}–{FRAME_DURATION_MAX_US//1000} ms")
     except Exception as e:
         log.error(f"[PI ERROR] Camera configuration failed: {e}")
+        log.error("       If error mentions 'raw' size, your sensor doesn't support that mode.")
+        log.error(f"       Try RAW_WIDTH=1296, RAW_HEIGHT=972 (other OV5647 native mode).")
         cam.close()
         raise
 
@@ -281,8 +288,21 @@ def _capture_loop_picamera2():
         cam.start()
         log.info(f"[OK]  Camera started — waiting {CAMERA_WARMUP_S}s for auto-exposure to settle")
         time.sleep(CAMERA_WARMUP_S)
+        # Verify the camera is actually delivering frames by grabbing one test array.
+        # This will raise immediately if the sensor is still timing out, rather than
+        # failing silently and sending zero frames to the server.
+        log.info("[OK]  Warmup done — verifying first frame delivery...")
+        test = cam.capture_array("main")
+        log.info(f"[OK]  Test frame OK: shape={test.shape}, dtype={test.dtype}")
+        del test
     except Exception as e:
-        log.error(f"[PI ERROR] Camera failed to start: {e}")
+        log.error(f"[PI ERROR] Camera failed to start or deliver frames: {e}")
+        log.error("       This is almost always a hardware issue:")
+        log.error("       1. Reseat the ribbon cable on BOTH ends (Pi and camera).")
+        log.error("       2. Check the camera connector lock is fully closed.")
+        log.error("       3. Try: vcgencmd get_camera  →  should say supported=1 detected=1")
+        cam.close()
+        raise
         log.error("       This is usually a hardware issue — check ribbon cable seating.")
         cam.close()
         raise
