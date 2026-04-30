@@ -377,12 +377,28 @@ def _capture_loop_picamera2():
 
 
 def _capture_loop_opencv():
-    """Fallback capture loop using OpenCV + V4L2 (USB webcams or legacy Pi cameras)."""
+    """
+    Fallback capture loop using OpenCV + V4L2 (USB webcams or legacy Pi cameras).
+
+    LOW-LATENCY DESIGN:
+    - A dedicated reader thread drains the V4L2 kernel buffer continuously,
+      always keeping only the newest frame. Without this, OpenCV queues up
+      several frames internally and cap.read() returns stale ones.
+    - The push thread always grabs the latest frame, never a buffered one.
+    - If a push takes longer than one frame interval (slow WiFi), we skip
+      the intermediate frames rather than sending them late.
+    """
     _log_section("CAMERA INIT (OpenCV/V4L2 fallback)")
     import cv2
+    import threading as _threading
 
     log.info(f"Trying /dev/video0 at {CAPTURE_WIDTH}x{CAPTURE_HEIGHT}, target {FPS} fps")
     cap = cv2.VideoCapture(0)
+
+    # Set buffer size to 1 so the kernel holds at most 1 frame.
+    # Default is 4 — those 4 frames sitting in the kernel buffer are
+    # what cause the "showing events from 2 seconds ago" problem.
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_HEIGHT)
     cap.set(cv2.CAP_PROP_FPS, FPS)
@@ -392,38 +408,110 @@ def _capture_loop_opencv():
         log.error("       Run: ls /dev/video* — if nothing listed, no camera detected.")
         sys.exit(1)
 
-    log.info(f"[OK]  Camera ready via OpenCV — pushing to {PUSH_URL}")
+    # Verify actual negotiated resolution (USB cameras often ignore requests)
+    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    actual_fps = cap.get(cv2.CAP_PROP_FPS)
+    log.info(f"[OK]  Camera negotiated: {actual_w}x{actual_h} @ {actual_fps:.1f} fps")
+    if actual_w != CAPTURE_WIDTH or actual_h != CAPTURE_HEIGHT:
+        log.warning(f"[WARN] Requested {CAPTURE_WIDTH}x{CAPTURE_HEIGHT} but got {actual_w}x{actual_h} — using actual")
+
     encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
-    ok_count = fail_count = 0
+
+    # ── Shared state between reader thread and push loop ──────────────────────
+    _latest_cv_frame = [None]   # list so closure can mutate it
+    _frame_ready = _threading.Event()
+    _reader_running = [True]
+
+    def _reader_thread():
+        """
+        Continuously reads frames from the camera into _latest_cv_frame.
+        By always reading as fast as possible we drain the kernel buffer,
+        ensuring the push loop always gets the frame that was captured NOW,
+        not 500ms ago.
+        """
+        consec_fail = 0
+        while _reader_running[0]:
+            ret, frame = cap.read()
+            if not ret:
+                consec_fail += 1
+                if consec_fail % 10 == 0:
+                    log.warning(f"[PI WARN] Reader: {consec_fail} consecutive read failures")
+                time.sleep(0.02)
+                continue
+            consec_fail = 0
+            _latest_cv_frame[0] = frame
+            _frame_ready.set()
+
+    reader = _threading.Thread(target=_reader_thread, daemon=True, name="cv-reader")
+    reader.start()
+    log.info(f"[OK]  Reader thread started — pushing to {PUSH_URL}")
+
+    ok_count = fail_count = consec_push_fail = 0
+    last_report = time.monotonic()
 
     try:
         while True:
             t0 = time.monotonic()
-            ret, frame = cap.read()
-            if not ret:
-                log.warning("[PI WARN] Frame capture failed — retrying")
-                time.sleep(0.5)
+
+            # Wait for a fresh frame (timeout = 2x frame interval)
+            got = _frame_ready.wait(timeout=INTERVAL * 2)
+            _frame_ready.clear()
+
+            if not got:
+                log.warning("[PI WARN] No frame from reader thread in time — camera stalled?")
+                consec_push_fail += 1
+                if consec_push_fail >= 10:
+                    log.error("[PI ERROR] Reader stalled for 10 intervals — restarting")
+                    raise RuntimeError("Reader thread stalled")
                 continue
 
+            frame = _latest_cv_frame[0]
+            if frame is None:
+                continue
+
+            # Encode to JPEG
             ok, buf = cv2.imencode(".jpg", frame, encode_params)
             if not ok:
                 log.warning("[PI WARN] JPEG encode failed")
                 continue
 
-            if _push_frame(buf.tobytes()):
+            jpeg = buf.tobytes()
+            kb = len(jpeg) / 1024
+
+            # Push — if this takes too long, the reader thread has already
+            # captured newer frames; _frame_ready will be set again immediately.
+            if _push_frame(jpeg):
                 ok_count += 1
+                consec_push_fail = 0
             else:
                 fail_count += 1
+                consec_push_fail += 1
 
-            if (ok_count + fail_count) % 100 == 0:
-                log.info(f"[STATS] {ok_count} ok / {fail_count} failed")
+            # Periodic stats
+            now = time.monotonic()
+            if now - last_report >= 30:
+                total = ok_count + fail_count
+                rate = ok_count / max(total, 1) * 100
+                push_ms = (time.monotonic() - t0) * 1000
+                log.info(
+                    f"[STATS] {ok_count} ok / {fail_count} failed ({rate:.0f}% success) | "
+                    f"frame {kb:.1f} KB | push {push_ms:.0f} ms"
+                )
+                last_report = now
 
+            # Pace: sleep only what's left of the frame interval.
+            # If the push took longer than INTERVAL, skip sleep entirely —
+            # the reader has already buffered the next frame for us.
             elapsed = time.monotonic() - t0
-            time.sleep(max(0.0, INTERVAL - elapsed))
+            sleep_for = max(0.0, INTERVAL - elapsed)
+            if sleep_for > 0:
+                time.sleep(sleep_for)
 
     except KeyboardInterrupt:
         log.info("Interrupted by user — shutting down")
     finally:
+        _reader_running[0] = False
         cap.release()
         log.info("Camera released")
 
@@ -454,7 +542,8 @@ if __name__ == "__main__":
     # ── Camera selection and outer restart loop ───────────────────────────────
     use_picamera2 = False
     use_opencv = True
-    log.info("[FORCED] Using OpenCV (V4L2) with camera index 0")
+
+   log.warning("Forcing to use OpenCV/V4L2")
 
     if not use_picamera2:
         try:
