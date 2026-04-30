@@ -543,8 +543,6 @@ if __name__ == "__main__":
     use_picamera2 = False
     use_opencv = True
 
-   log.warning("Forcing to use OpenCV/V4L2")
-
     if not use_picamera2:
         try:
             import cv2  # noqa: F401
