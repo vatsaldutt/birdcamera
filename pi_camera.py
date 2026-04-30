@@ -453,14 +453,8 @@ if __name__ == "__main__":
 
     # ── Camera selection and outer restart loop ───────────────────────────────
     use_picamera2 = False
-    use_opencv = False
-
-    try:
-        import picamera2  # noqa: F401
-        use_picamera2 = True
-        log.info("[OK]  picamera2 found — using native Pi Camera Module driver")
-    except ImportError:
-        log.warning("[WARN] picamera2 not found — trying OpenCV/V4L2")
+    use_opencv = True
+    log.info("[FORCED] Using OpenCV (V4L2) with camera index 0")
 
     if not use_picamera2:
         try:
